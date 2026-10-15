@@ -6,7 +6,7 @@ Updated 15 Oct 2026. Gate owners: product lead and technical lead (today, the ow
 
 | M01 gate test | Status | Evidence |
 |---|---|---|
-| A clean clone builds a starter Android app, web shell and API health test via documented CI commands | Web and API pass locally. The Android build is verified in GitHub Actions only | Commands in the root README; CI workflow `.github/workflows/ci.yml` |
+| A clean clone builds a starter Android app, web shell and API health test via documented CI commands | **Pass.** All three CI jobs were green on PR #1, including the first Android build with unit tests and lint | [CI run 38729101193](https://github.com/bibekthapamgr/yashi-vpn/actions/runs/38729101193); commands in the root README |
 | No committed secrets; the team reaches staging with individual permissions; the database is not public | Secret scan runs in CI. No staging exists yet because procurement is blocked | `secret-scan` CI job; [environments](../ops/environments.md); [access matrix](../ops/access-matrix.md) |
 | Owner-approved scope and budget, plus a list of unresolved decisions | Done in part | [ADR-0001](../decisions/ADR-0001-owner-scope-decisions.md) lists what is accepted and what is open |
 | Provider permission documented, or procurement explicitly blocked | **Procurement explicitly blocked** until a provider confirms in writing | [provider checklist](../ops/provider-checklist.md), [ADR-0011](../decisions/ADR-0011-first-region-and-provider.md) |
@@ -38,6 +38,6 @@ Not started. M01 asks for an approved screen inventory, a navigation diagram, th
 
 ## Known limits of this evidence
 
-- The Android build could not run in the workspace that created this repository, because Google's Maven repository is blocked there. GitHub Actions is the first Android build.
+- The Android build runs only in GitHub Actions, because Google's Maven repository was blocked in the workspace that created this repository. Its first run passed (run 38729101193). No physical-device run exists yet; that starts in M03.
 - Lease switching, web session style (cookies or bearer tokens) and several retention periods are proposals in the drafts and need lead and owner review.
 - Do not deploy anything publicly at this gate (M01 handoff rule).
