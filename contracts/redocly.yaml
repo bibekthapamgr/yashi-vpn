@@ -1,0 +1,6 @@
+# Lint rules for contracts/openapi.yaml (run: npm run contracts:lint)
+extends:
+  - recommended
+rules:
+  # Proprietary source: no public license in the API description.
+  info-license: off

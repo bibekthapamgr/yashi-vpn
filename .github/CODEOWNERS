@@ -1,0 +1,4 @@
+# The owner reviews everything until team leads are invited (team pack 01 §4).
+# When the team joins, add a second reviewer for security-sensitive paths:
+# /api/ /node-agent/ /infra/ /android/ /contracts/
+* @bibekthapamgr

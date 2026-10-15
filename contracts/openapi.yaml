@@ -1,0 +1,3298 @@
+openapi: 3.1.0
+info:
+  title: Yashi VPN API
+  version: 0.1.0-draft
+  summary: Control-plane API for the Yashi VPN Android app, public website, customer portal and admin portal.
+  description: |
+    **Draft for review by the Android, backend and ops leads at the M01 gate** (team pack M01, task 7).
+    Only `GET /health` is implemented (`api/src/app.ts`). Every other operation is a proposal, built in the
+    milestone named by its `x-milestone` extension, and may change during review.
+
+    Rules from team pack 03 ("Proposed API contract") that apply to every operation:
+
+    - Version `/v1`. JSON only: request and response bodies are `application/json`.
+    - Timestamps are UTC ISO 8601 date-times with a `Z` suffix.
+    - Byte values are `int64` integers in bytes and stay within the JavaScript safe-integer range.
+      1 GiB = 1,073,741,824 bytes.
+    - Lists use cursor pagination: `cursor` and `limit` query parameters; responses return `items` and
+      `nextCursor` (null on the last page).
+    - Every 4xx and 5xx response uses the shared `Error` body: `code`, safe `message`, `requestId` and
+      optional `retryAfter`. No stack traces or secrets. Clients show localized copy for `code`.
+    - Every response carries a server-generated `X-Request-Id` and `Cache-Control: no-store`.
+    - Ownership is checked server-side on every object. Objects that belong to another account return 404.
+    - Customer endpoints use `customerBearer`. `/admin/*` uses the separate `adminSession` scheme. Every admin
+      mutation needs a `reason` and an `Idempotency-Key`; `x-admin-roles` lists the roles allowed to call an
+      admin operation and `x-step-up-required` marks disruptive ones.
+    - Pending node work is never reported as complete. Clients poll status resources with backoff and jitter.
+    - No operation accepts or returns a device private key.
+
+    Text marked **Proposed** is a design choice that the team pack does not fix.
+servers:
+  - url: https://api.example.com/v1
+    description: Placeholder. No domain has been approved or purchased (team pack 00); replace once the owner approves one.
+security:
+  - customerBearer: []
+tags:
+  - name: Health
+    description: Liveness check. The only operation implemented in M01.
+  - name: Auth
+    description: Registration, email verification, sign-in, token rotation and password reset. Rate limited. Responses never reveal whether an email address has an account.
+  - name: Account
+    description: The signed-in customer's account, entitlement and authoritative usage.
+  - name: Password and sessions
+    description: Password change with reauthentication, and the customer's own sign-in sessions.
+  - name: Privacy
+    description: Privacy choices, enforced server-side and recorded with the privacy-text version.
+  - name: Devices
+    description: Device enrollment with a public key only, and revocation that removes real node access.
+  - name: Locations
+    description: Sanitized public catalog of VPN locations.
+  - name: Leases
+    description: Short-lived, idempotent peer leases that authorize one device on one VPN node.
+  - name: Status
+    description: Public, sanitized service status and current incidents.
+  - name: Beta interest
+    description: Public, consented beta signup used before the Play listing is live.
+  - name: Support
+    description: Support tickets scoped to their owner.
+  - name: Diagnostics
+    description: Opt-in, redacted diagnostics reports sent only after an in-app preview and explicit consent.
+  - name: Account deletion
+    description: Authenticated account deletion with immediate session and peer revocation.
+  - name: Billing
+    description: Future (M10). Google Play purchase verification. Not implemented; stays behind a feature flag until owner approval.
+  - name: Admin users
+    description: Customer accounts as seen by staff. Emails are masked by default; no password, key, token or traffic views and no impersonation.
+  - name: Admin devices
+    description: Staff revocation of customer devices.
+  - name: Admin nodes
+    description: VPN node fleet state, drain and emergency revocation. No cloud credentials or node private keys are exposed.
+  - name: Admin plans
+    description: Immutable, versioned plan configuration.
+  - name: Admin audit
+    description: Append-only record of administrative access and changes (actor, action, object, reason, UTC time). No traffic destinations.
+  - name: Admin incidents
+    description: Incident drafting and publishing for the public status page.
+  - name: Admin operations
+    description: Status resources for asynchronous admin operations that wait for node-agent acknowledgement.
+x-tagGroups:
+  - name: Public
+    tags: [Health, Status, Locations, Beta interest]
+  - name: Customer
+    tags: [Auth, Account, Password and sessions, Privacy, Devices, Leases, Support, Diagnostics, Account deletion, Billing]
+  - name: Admin
+    tags: [Admin users, Admin devices, Admin nodes, Admin plans, Admin audit, Admin incidents, Admin operations]
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Liveness check
+      description: Implemented in M01 (`api/src/app.ts`). Reports that the API process is up; it does not check dependencies. The 429 response is Proposed (edge rate limiting) and not implemented yet.
+      tags: [Health]
+      security: []
+      x-milestone: M01
+      responses:
+        '200':
+          description: The API process is up.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/X-Request-Id'
+            Cache-Control:
+              $ref: '#/components/headers/Cache-Control'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+              example:
+                status: ok
+                service: yashi-api
+                version: 0.1.0
+                time: '2026-10-15T12:00:00.000Z'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/register:
+    post:
+      operationId: register
+      summary: Create an account
+      description: >-
+        Creates an unverified account and emails a single-use verification token. The response is identical
+        whether or not the address already has an account (anti-enumeration). Proposed: the owner of an
+        existing account gets a notice email instead. Rate limited per client and per address.
+      tags: [Auth]
+      security: []
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '202':
+          $ref: '#/components/responses/GenericAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/verify:
+    post:
+      operationId: verifyEmail
+      summary: Verify an email address
+      description: Consumes a single-use email-verification token. Invalid, expired and already-used tokens all return the same 400 `invalid_token`.
+      tags: [Auth]
+      security: []
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+      responses:
+        '204':
+          description: Email address verified.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/login:
+    post:
+      operationId: logIn
+      summary: Sign in
+      description: >-
+        Returns a short-lived access token and a rotating refresh token, and creates a session. An unknown
+        email and a wrong password return the same 401 `invalid_credentials` (anti-enumeration). Proposed:
+        403 `email_not_verified` is returned only after a correct password; suspended accounts can sign in
+        (to reach support and deletion) but cannot obtain leases.
+      tags: [Auth]
+      security: []
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`invalid_credentials`, identical for unknown emails and wrong passwords.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`email_not_verified` (only after a correct password).'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/refresh:
+    post:
+      operationId: refreshSession
+      summary: Rotate the refresh token
+      description: >-
+        Exchanges a refresh token for a new access token and a new refresh token; the old refresh token stops
+        working. Proposed: presenting an already-rotated refresh token revokes the whole session (reuse detection).
+      tags: [Auth]
+      security: []
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New token pair. The previous refresh token is no longer valid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/logout:
+    post:
+      operationId: logOut
+      summary: Sign out
+      description: Revokes the session that the access token belongs to, including its refresh token.
+      tags: [Auth]
+      x-milestone: M04
+      responses:
+        '204':
+          description: Session revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/reset/request:
+    post:
+      operationId: requestPasswordReset
+      summary: Request a password reset email
+      description: Emails a single-use reset token if the address has an account. The response is identical either way (anti-enumeration). Rate limited per client and per address.
+      tags: [Auth]
+      security: []
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '202':
+          $ref: '#/components/responses/GenericAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /auth/reset/confirm:
+    post:
+      operationId: confirmPasswordReset
+      summary: Set a new password with a reset token
+      description: 'Consumes a single-use reset token and sets a new password. Proposed: every session of the account is revoked. Invalid, expired and already-used tokens all return the same 400 `invalid_token`.'
+      tags: [Auth]
+      security: []
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirmRequest'
+      responses:
+        '204':
+          description: Password changed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /me:
+    get:
+      operationId: getMe
+      summary: Get the signed-in account
+      description: The caller's account. A suspended account still gets 200, so the app can show the Unavailable state.
+      tags: [Account]
+      x-milestone: M04
+      responses:
+        '200':
+          description: The caller's account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /me/entitlement:
+    get:
+      operationId: getMyEntitlement
+      summary: Get the current entitlement
+      description: Derived by the server from the plan version and, from M10, the verified purchase state. Clients never send entitlement or premium flags.
+      tags: [Account]
+      x-milestone: M04
+      responses:
+        '200':
+          description: The caller's current entitlement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Entitlement'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /me/usage:
+    get:
+      operationId: getMyUsage
+      summary: Get usage for the current quota period
+      description: >-
+        Authoritative account-wide quota state for the current period, which starts at 00:00 UTC on the first
+        calendar day of the month. Clients show the reset time from `periodEnd` and a stale indicator based on
+        `lastMeasuredAt`. Client clocks, reinstalls and app termination never change these values.
+      tags: [Account]
+      x-milestone: M04
+      responses:
+        '200':
+          description: Usage for the current period.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Usage'
+              example:
+                periodStart: '2026-10-01T00:00:00Z'
+                periodEnd: '2026-11-01T00:00:00Z'
+                quotaBytes: 5368709120
+                usedBytes: 1288490189
+                remainingBytes: 4080218931
+                state: available
+                lastMeasuredAt: '2026-10-15T11:58:00Z'
+                daily:
+                  - date: '2026-10-14'
+                    bytes: 1073741824
+                  - date: '2026-10-15'
+                    bytes: 214748365
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /me/password:
+    post:
+      operationId: changePassword
+      summary: Change password
+      description: Requires reauthentication with the current password. Revokes every other session of the account; the calling session stays signed in.
+      tags: [Password and sessions]
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordChangeRequest'
+      responses:
+        '204':
+          description: Password changed and other sessions revoked.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`reauthentication_failed`: the current password is wrong.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /me/sessions:
+    get:
+      operationId: listMySessions
+      summary: List my sessions
+      description: 'Active sessions of the caller. Proposed: sessions record only the client type, not IP addresses or user agents.'
+      tags: [Password and sessions]
+      x-milestone: M04
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of sessions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /me/sessions/{id}:
+    parameters:
+      - $ref: '#/components/parameters/SessionId'
+    delete:
+      operationId: revokeMySession
+      summary: Revoke one of my sessions
+      description: 'Revokes the session and its refresh token. Proposed: the API checks session state on every request, so revoked sessions stop working immediately.'
+      tags: [Password and sessions]
+      x-milestone: M04
+      responses:
+        '204':
+          description: Session revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /me/privacy:
+    get:
+      operationId: getPrivacyChoices
+      summary: Get privacy choices
+      description: Current value of each privacy choice and the privacy-text version under which it was last set.
+      tags: [Privacy]
+      x-milestone: M04
+      responses:
+        '200':
+          description: Current choices and the current privacy-text version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyChoices'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    patch:
+      operationId: updatePrivacyChoices
+      summary: Update privacy choices
+      description: >-
+        Records each change with the time and the privacy-text version the user saw, and enforces the choice
+        server-side wherever the API processes the data. Proposed: 409 `privacy_text_outdated` when
+        `privacyTextVersion` is not the current version, so the client shows the current text first.
+      tags: [Privacy]
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PrivacyChoicesUpdate'
+      responses:
+        '200':
+          description: Updated choices.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PrivacyChoices'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`privacy_text_outdated`.'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /devices:
+    post:
+      operationId: enrollDevice
+      summary: Enroll a device
+      description: >-
+        Registers the WireGuard public key that the device generated locally. The request schema rejects unknown
+        fields, so no other key material can be sent. The device-limit check (plan `deviceLimit`; proposed 1 for
+        free) runs in the same transaction as the insert. Public keys are unique across all devices (Proposed:
+        including revoked devices, so a revoked key can never be enrolled again).
+      tags: [Devices]
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceEnrollmentRequest'
+      responses:
+        '201':
+          description: Device enrolled.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`account_unavailable` (suspended account).'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`device_limit_reached` or `public_key_conflict`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    get:
+      operationId: listDevices
+      summary: List my devices
+      description: Active devices and devices with a pending or completed revocation.
+      tags: [Devices]
+      x-milestone: M04
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of devices.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /devices/{id}:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    delete:
+      operationId: revokeDevice
+      summary: Revoke a device
+      description: >-
+        Revokes the device and ends its leases. Revocation is complete only when the node acknowledges removal of
+        the peer; until then the device shows `revocation_pending`, and `accessEndsBy` is the latest time access can
+        continue (the hard lease expiry) if the node is unreachable. Poll `GET /devices`.
+      tags: [Devices]
+      x-milestone: M04
+      responses:
+        '200':
+          description: Already revoked and confirmed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '202':
+          description: Revocation accepted. The device shows `revocation_pending` until the node confirms removal.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Device'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /locations:
+    get:
+      operationId: listLocations
+      summary: List VPN locations
+      description: >-
+        Public, sanitized catalog derived from node health: no management addresses, provider references,
+        credentials or per-node load. Maintenance and capacity states are shown honestly. `measuredAt` and
+        `measurementAgeSeconds` describe the server's latest health measurement; this endpoint never reports
+        latency (the app measures and timestamps that itself). Used by the app and the public website. Not
+        paginated: the catalog is bounded by the fleet size.
+      tags: [Locations]
+      security: []
+      x-milestone: M04
+      responses:
+        '200':
+          description: The current catalog.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LocationCatalog'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /leases:
+    post:
+      operationId: createLease
+      summary: Request a lease
+      description: |
+        Authorizes one active device of the caller on a node in the chosen location and reserves quota
+        account-wide in the same transaction. Provisioning is asynchronous: a 202 does not mean the peer is
+        ready. Poll `GET /leases/{id}` with backoff and jitter until `provisioning.state` is `ready`, then connect
+        and verify the tunnel. The response holds everything the device needs to compose its WireGuard
+        configuration locally with its own key; no key material is sent to the device.
+
+        Grants fail closed: if entitlement, quota or node authorization cannot be validated, the API returns 503
+        and grants nothing.
+
+        Proposed switch behaviour: a free account holds one active lease. A new request moves the existing
+        lease to `revoking`, and the new lease stays `pending` (`provisioning.reason` is
+        `awaiting_previous_revocation`) until the old peer's removal is acknowledged or its hard expiry passes,
+        so two peers never overlap. The old lease's unused reservation is returned only then.
+
+        A retry with the same `Idempotency-Key` returns the original response.
+      tags: [Leases]
+      x-milestone: M04
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeaseRequest'
+      responses:
+        '202':
+          description: Lease created; provisioning is pending.
+          headers:
+            Location:
+              $ref: '#/components/headers/Location'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lease'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`quota_exhausted` or `account_unavailable`.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: The device or location does not exist for this caller.
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`device_not_active`, `location_unavailable` (maintenance or no capacity) or `idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /leases/{id}:
+    parameters:
+      - $ref: '#/components/parameters/LeaseId'
+    get:
+      operationId: getLease
+      summary: Get a lease and its provisioning state
+      description: >-
+        Desired versus actual node state, with an explicit `provisioning.state` of `pending`, `ready` or `failed`.
+        The device may connect only when `state` is `active`, `provisioning.desired` is `present` and
+        `provisioning.state` is `ready`. A successful connection still needs the in-tunnel reachability check.
+      tags: [Leases]
+      x-milestone: M04
+      responses:
+        '200':
+          description: The lease.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lease'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    delete:
+      operationId: revokeLease
+      summary: End a lease
+      description: >-
+        Asks the node to remove the peer. The lease stays `revoking` until the node acknowledges removal and ends
+        no later than `expiresAt`. A failed disconnect in the app does not return quota; the unused reservation
+        returns only after confirmed removal or enforced expiry.
+      tags: [Leases]
+      x-milestone: M04
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: The lease had already ended.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lease'
+        '202':
+          description: Revocation in progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lease'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /leases/{id}/renew:
+    parameters:
+      - $ref: '#/components/parameters/LeaseId'
+    post:
+      operationId: renewLease
+      summary: Renew a lease
+      description: >-
+        Extends `expiresAt` and, when needed, the quota reservation. Proposed in team pack 03: renew every
+        5 minutes, hard lifetime 15 minutes after the latest renewal, tuned after load and reliability tests.
+        Fails closed with 503 when authorization cannot be validated; the existing peer then keeps working only
+        until `expiresAt`.
+      tags: [Leases]
+      x-milestone: M04
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: Lease renewed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Lease'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`quota_exhausted` or `account_unavailable`. The node removes access at exhaustion regardless of the app.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`lease_not_active` or `idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /status:
+    get:
+      operationId: getStatus
+      summary: Get public service status
+      description: Sanitized component status and current published incidents for the website status page and the app's Help screen. Contains no user data, node identifiers or management details.
+      tags: [Status]
+      security: []
+      x-milestone: M06
+      responses:
+        '200':
+          description: Current status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceStatus'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /beta-interest:
+    post:
+      operationId: registerBetaInterest
+      summary: Join the beta interest list
+      description: >-
+        Consented signup used before the Play listing is live. Sends a confirmation email that includes a withdrawal
+        link; the address is not used until confirmed. The response is identical for new, pending, confirmed and
+        withdrawn addresses (anti-enumeration). Rate limited per client and per address.
+      tags: [Beta interest]
+      security: []
+      x-milestone: M06
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BetaInterestRequest'
+      responses:
+        '202':
+          $ref: '#/components/responses/GenericAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /beta-interest/confirm:
+    post:
+      operationId: confirmBetaInterest
+      summary: Confirm a beta interest signup
+      description: Proposed path for the email confirmation required by team pack 03. Consumes the token from the confirmation email.
+      tags: [Beta interest]
+      security: []
+      x-milestone: M06
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+      responses:
+        '204':
+          description: Signup confirmed.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '`invalid_token`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /beta-interest/withdraw:
+    post:
+      operationId: withdrawBetaInterest
+      summary: Withdraw from the beta interest list
+      description: Proposed path for the withdrawal link required by team pack 03. Uses the token from the link in any beta email; the contact is then deleted under the retention rules (team pack 04).
+      tags: [Beta interest]
+      security: []
+      x-milestone: M06
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TokenRequest'
+      responses:
+        '204':
+          description: Withdrawn.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '`invalid_token`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /support/tickets:
+    post:
+      operationId: createSupportTicket
+      summary: Open a support ticket
+      description: >-
+        Minimally necessary content only. Proposed: no file attachments in v1 (support attachment abuse is a listed
+        threat); a diagnostics report can be linked by ID after its own consented upload. Proposed retention:
+        90 days after close (team pack 04).
+      tags: [Support]
+      x-milestone: M06
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TicketCreateRequest'
+      responses:
+        '201':
+          description: Ticket opened.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ticket'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    get:
+      operationId: listSupportTickets
+      summary: List my support tickets
+      description: The caller's tickets, newest first. Tickets of other accounts are never listed.
+      tags: [Support]
+      x-milestone: M06
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of the caller's tickets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /support/tickets/{id}:
+    parameters:
+      - $ref: '#/components/parameters/TicketId'
+    get:
+      operationId: getSupportTicket
+      summary: Get a support ticket with its replies
+      description: Proposed addition so the customer portal can show replies (team pack 02, M06).
+      tags: [Support]
+      x-milestone: M06
+      responses:
+        '200':
+          description: The ticket and its messages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TicketDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /diagnostics:
+    post:
+      operationId: submitDiagnostics
+      summary: Upload a redacted diagnostics report
+      description: >-
+        Opt-in only. The app shows the redacted report to the user and sends it only after explicit consent,
+        recorded in `consent`. Reports never contain browsing destinations, DNS queries, packet data, tokens or
+        keys. Proposed: the payload uses an allow-list of fields defined in M05 and the server rejects anything
+        else; bodies over 64 KiB return 413. Reports expire after the retention period (proposed 30 days, team
+        pack 04).
+      tags: [Diagnostics]
+      x-milestone: M05
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DiagnosticsSubmission'
+      responses:
+        '201':
+          description: Report stored until `retentionExpiresAt`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticsReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /me/deletion:
+    post:
+      operationId: requestAccountDeletion
+      summary: Delete my account
+      description: >-
+        Requires reauthentication with the current password. Immediately revokes every session and asks every
+        node to remove the account's peers; account data is then deleted or anonymized on the documented schedule
+        (team pack 04). The caller's tokens stop working once this returns, so the response is the last status
+        the client can show. Deleting the account does not cancel a Google Play subscription (M10); the client
+        links to Play subscription management instead.
+      tags: [Account deletion]
+      x-milestone: M04
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountDeletionRequest'
+      responses:
+        '202':
+          description: Deletion started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountDeletionReceipt'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`reauthentication_failed`: the current password is wrong.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /billing/play/verify:
+    post:
+      operationId: verifyPlayPurchase
+      summary: Verify a Google Play purchase (future, M10)
+      description: >-
+        Future (M10): not implemented, and behind a feature flag until owner approval. The backend verifies the
+        purchase token with Google Play, acknowledges it, links it to exactly one account and derives the
+        entitlement from the verified state. The app never sends, and the API never accepts, a premium flag or an
+        expiry date: the request schema rejects unknown fields. A token already linked to another account returns
+        409 and grants nothing (replay protection). Play notifications and scheduled reconciliation update the
+        state server-side and are not part of this client contract.
+      tags: [Billing]
+      x-milestone: M10
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlayPurchaseVerificationRequest'
+      responses:
+        '200':
+          description: Verified purchase state and the resulting entitlement.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlayPurchaseVerificationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`purchase_already_linked`: the token belongs to another account.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+          description: Google Play could not be reached; nothing is granted.
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/users:
+    get:
+      operationId: adminListUsers
+      summary: List customer accounts
+      description: 'Customer `User` accounts, not staff. Emails are masked. Proposed: reads of customer records are recorded in the admin audit as access events.'
+      tags: [Admin users]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator, support]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          required: false
+          description: Filter by account status.
+          schema:
+            $ref: '#/components/schemas/CustomerStatus'
+      responses:
+        '200':
+          description: One page of customers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/users/search:
+    post:
+      operationId: adminSearchUsers
+      summary: Find a customer by exact email
+      description: >-
+        Masked-user search for limited roles (M07). Exact match on the normalized address; results stay masked.
+        Proposed: POST keeps the address out of URLs and access logs, and a `reason` (for example a ticket ID) is
+        required because the result reveals whether an address has an account. Audited as an access event.
+      tags: [Admin users]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator, support]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerSearchRequest'
+      responses:
+        '200':
+          description: Matching customers (zero or one).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      operationId: adminGetUser
+      summary: Get a customer account
+      description: Masked email, account state, plan, devices, quota aggregate and support history (team pack 02). Never shows passwords, tokens, keys, WireGuard configurations or traffic data. Audited as an access event (Proposed).
+      tags: [Admin users]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator, support]
+      responses:
+        '200':
+          description: The customer.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/users/{id}/suspend:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      operationId: adminSuspendUser
+      summary: Suspend a customer account
+      description: Blocks new leases, revokes sessions and asks every node to remove the account's peers. The operation completes only after node acknowledgement or enforced lease expiry.
+      tags: [Admin users]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator]
+      x-step-up-required: true
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminReasonRequest'
+      responses:
+        '202':
+          $ref: '#/components/responses/AdminOperationAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`already_suspended` or `idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/users/{id}/reactivate:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      operationId: adminReactivateUser
+      summary: Reactivate a suspended customer account
+      description: Allows sign-in and new leases again. Revoked devices stay revoked and used quota is not restored.
+      tags: [Admin users]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator]
+      x-step-up-required: true
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminReasonRequest'
+      responses:
+        '200':
+          description: Account reactivated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`not_suspended` or `idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/devices/{id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/DeviceId'
+    post:
+      operationId: adminRevokeDevice
+      summary: Revoke a customer device
+      description: Same effect as the customer's own revocation, with a reason and audit. The operation completes only after the node acknowledges peer removal or the lease hard-expires.
+      tags: [Admin devices]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator]
+      x-step-up-required: true
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminReasonRequest'
+      responses:
+        '202':
+          $ref: '#/components/responses/AdminOperationAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/nodes:
+    get:
+      operationId: adminListNodes
+      summary: List VPN nodes
+      description: Region, lifecycle, heartbeat age, measured utilization, active leases, transfer allowance and provider billing period (team pack 02). Live peers, recent handshakes and active accounts are counted separately, never interchangeably.
+      tags: [Admin nodes]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator, read_only]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: lifecycle
+          in: query
+          required: false
+          description: Filter by lifecycle state.
+          schema:
+            $ref: '#/components/schemas/NodeLifecycle'
+      responses:
+        '200':
+          description: One page of nodes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/nodes/{id}:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    get:
+      operationId: adminGetNode
+      summary: Get a VPN node
+      description: Same fields as the list. Never includes cloud or management credentials or the node's private key.
+      tags: [Admin nodes]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator, read_only]
+      responses:
+        '200':
+          description: The node.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Node'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/nodes/{id}/drain:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      operationId: adminDrainNode
+      summary: Drain a VPN node
+      description: Excludes the node from new leases immediately. Existing leases continue until they end or expire. The operation completes only when no active lease remains on the node, never earlier.
+      tags: [Admin nodes]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator]
+      x-step-up-required: true
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminReasonRequest'
+      responses:
+        '202':
+          $ref: '#/components/responses/AdminOperationAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`invalid_lifecycle_state` or `idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/nodes/{id}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/NodeId'
+    post:
+      operationId: adminRevokeNode
+      summary: Emergency-revoke a VPN node
+      description: >-
+        For a suspected compromise or leaked node key. Stops new leases, ends every lease on the node, revokes the
+        node agent's credentials and quarantines the node; connected users are disconnected. Does not delete the
+        server (no automatic deletion of a production node without the approved runbook).
+      tags: [Admin nodes]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator]
+      x-step-up-required: true
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminReasonRequest'
+      responses:
+        '202':
+          $ref: '#/components/responses/AdminOperationAccepted'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`invalid_lifecycle_state` or `idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/plan-versions:
+    get:
+      operationId: adminListPlanVersions
+      summary: List plan versions
+      description: All versions, newest first. Versions are immutable; a change creates a new version.
+      tags: [Admin plans]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator, support, read_only]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of plan versions, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanVersionList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    post:
+      operationId: adminCreatePlanVersion
+      summary: Create a plan version
+      description: >-
+        Plan versions are immutable: there is no update or delete. A new version applies from `effectiveFrom`, and
+        reducing a quota never retroactively consumes data (team pack 02). Proposed: `effectiveFrom` must be in
+        the future.
+      tags: [Admin plans]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner]
+      x-step-up-required: true
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlanVersionCreateRequest'
+      responses:
+        '201':
+          description: Plan version created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlanVersion'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/audit:
+    get:
+      operationId: adminListAudit
+      summary: List admin audit entries
+      description: Newest first. Entries hold actor, action, object, reason and UTC time; never credentials, request bodies or traffic destinations.
+      tags: [Admin audit]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator, read_only]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: actorId
+          in: query
+          required: false
+          description: Filter by the admin who acted.
+          schema:
+            type: string
+            format: uuid
+        - name: objectType
+          in: query
+          required: false
+          description: Filter by object type.
+          schema:
+            $ref: '#/components/schemas/AuditObjectType'
+        - name: objectId
+          in: query
+          required: false
+          description: Filter by object ID (requires `objectType`).
+          schema:
+            type: string
+            maxLength: 64
+        - name: from
+          in: query
+          required: false
+          description: Inclusive lower bound (UTC).
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+        - name: to
+          in: query
+          required: false
+          description: Exclusive upper bound (UTC).
+          schema:
+            $ref: '#/components/schemas/Timestamp'
+      responses:
+        '200':
+          description: One page of audit entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditEntryList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/incidents:
+    get:
+      operationId: adminListIncidents
+      summary: List incidents
+      description: Draft and published incidents, newest first.
+      tags: [Admin incidents]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator, support, read_only]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of incidents.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncidentList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+    post:
+      operationId: adminCreateIncident
+      summary: Create an incident
+      description: Published incidents appear on `GET /status`; drafts do not.
+      tags: [Admin incidents]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentCreateRequest'
+      responses:
+        '201':
+          description: Incident created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/incidents/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IncidentId'
+    patch:
+      operationId: adminUpdateIncident
+      summary: Update an incident
+      description: Changes status, impact or visibility and, when `message` is present, appends a public update. Earlier updates are never edited.
+      tags: [Admin incidents]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator]
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncidentUpdateRequest'
+      responses:
+        '200':
+          description: Incident updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Incident'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`idempotency_key_reused`.'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+  /admin/operations/{id}:
+    parameters:
+      - $ref: '#/components/parameters/AdminOperationId'
+    get:
+      operationId: adminGetOperation
+      summary: Get an asynchronous admin operation
+      description: Status resource returned in the `Location` header of 202 responses. Shows actual node-agent acknowledgements and never reports `completed` early.
+      tags: [Admin operations]
+      security:
+        - adminSession: []
+      x-milestone: M07
+      x-admin-roles: [owner, operator]
+      responses:
+        '200':
+          description: The operation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminOperation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/UnexpectedError'
+
+components:
+  securitySchemes:
+    customerBearer:
+      type: http
+      scheme: bearer
+      description: >-
+        Short-lived access token from `POST /auth/login` or `POST /auth/refresh`, sent in the `Authorization`
+        header. Rejected by every `/admin/*` operation. Proposed: the token is opaque to clients.
+    adminSession:
+      type: apiKey
+      in: cookie
+      name: yashi_admin_session
+      description: >-
+        Separate admin authentication for staff `AdminUser` accounts; customer tokens are never accepted. Issued
+        only after password and MFA, short-lived and bound to that MFA verification; no shared accounts.
+        Proposed: a Secure, HttpOnly, SameSite=Strict cookie (name Proposed) with CSRF protection on every
+        mutation. Operations marked `x-step-up-required` also need a recent MFA re-verification, otherwise they
+        return 403 `step_up_required`. Admin sign-in, MFA and step-up endpoints are specified in M07.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Client-generated key, unique per logical operation (Proposed: a UUID). A retry with the same key and the
+        same request returns the original response; reusing the key for a different request returns 409
+        `idempotency_key_reused`.
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from the previous page's `nextCursor`. Omit for the first page.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size (Proposed default 20, maximum 100).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    SessionId:
+      name: id
+      in: path
+      required: true
+      description: Session ID.
+      schema:
+        type: string
+        format: uuid
+    DeviceId:
+      name: id
+      in: path
+      required: true
+      description: Device ID.
+      schema:
+        type: string
+        format: uuid
+    LeaseId:
+      name: id
+      in: path
+      required: true
+      description: Lease ID.
+      schema:
+        type: string
+        format: uuid
+    TicketId:
+      name: id
+      in: path
+      required: true
+      description: Support ticket ID.
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: id
+      in: path
+      required: true
+      description: Customer user ID.
+      schema:
+        type: string
+        format: uuid
+    NodeId:
+      name: id
+      in: path
+      required: true
+      description: VPN node ID.
+      schema:
+        type: string
+        format: uuid
+    IncidentId:
+      name: id
+      in: path
+      required: true
+      description: Incident ID.
+      schema:
+        type: string
+        format: uuid
+    AdminOperationId:
+      name: id
+      in: path
+      required: true
+      description: Admin operation ID.
+      schema:
+        type: string
+        format: uuid
+
+  headers:
+    X-Request-Id:
+      description: Server-generated request ID, also returned as `requestId` in error bodies. Client-supplied values are ignored.
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Cache-Control:
+      description: Always `no-store`.
+      required: true
+      schema:
+        type: string
+        const: no-store
+    Retry-After:
+      description: Seconds to wait before retrying. Clients add jitter and never retry in a tight loop.
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+    Location:
+      description: URL of the status resource to poll.
+      required: true
+      schema:
+        type: string
+        format: uri-reference
+
+  responses:
+    GenericAccepted:
+      description: Accepted. Identical whether or not the address is known (anti-enumeration).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Accepted'
+    AdminOperationAccepted:
+      description: Accepted. Poll the operation in the `Location` header until it completes or fails.
+      headers:
+        Location:
+          $ref: '#/components/headers/Location'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminOperation'
+    BadRequest:
+      description: Malformed JSON or failed validation (`bad_request`, `validation_failed`, `invalid_token`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing, invalid or expired credentials (`unauthorized`, `invalid_credentials`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated but not allowed (`forbidden`, `account_unavailable`, `step_up_required` and the codes listed per operation).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Not found, or owned by another account. The two cases are indistinguishable (`not_found`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: Conflicts with the current state (codes listed per operation).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    PayloadTooLarge:
+      description: Request body over the size limit (`payload_too_large`).
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooManyRequests:
+      description: Rate limited (`rate_limited`). `Retry-After` and `retryAfter` give the wait in seconds.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ServiceUnavailable:
+      description: Fails closed (`service_unavailable`). Nothing new was granted; existing leases keep working only until their `expiresAt`.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    UnexpectedError:
+      description: Any other error, including 5xx (`internal_error`). Same `Error` body; never a stack trace.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/X-Request-Id'
+        Cache-Control:
+          $ref: '#/components/headers/Cache-Control'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      description: Shared body for every 4xx and 5xx response. Never contains stack traces, secrets or internal details.
+      additionalProperties: false
+      required: [code, message, requestId]
+      properties:
+        code:
+          type: string
+          pattern: '^[a-z][a-z0-9_]*$'
+          maxLength: 64
+          description: >-
+            Stable machine-readable code that clients map to localized copy. Implemented in M01: `not_found`,
+            `bad_request`, `internal_error`. Proposed for M04 onwards: `validation_failed`, `invalid_token`,
+            `unauthorized`, `invalid_credentials`, `email_not_verified`, `forbidden`, `account_unavailable`,
+            `reauthentication_failed`, `step_up_required`, `quota_exhausted`, `device_limit_reached`,
+            `public_key_conflict`, `device_not_active`, `location_unavailable`, `lease_not_active`,
+            `idempotency_key_reused`, `privacy_text_outdated`, `payload_too_large`, `purchase_already_linked`,
+            `already_suspended`, `not_suspended`, `invalid_lifecycle_state`, `rate_limited`, `service_unavailable`.
+        message:
+          type: string
+          maxLength: 500
+          description: Safe, human-readable English summary for logs and support. Not shown as UI copy.
+        requestId:
+          type: string
+          format: uuid
+          description: Same value as the `X-Request-Id` response header.
+        retryAfter:
+          type: integer
+          minimum: 0
+          description: Seconds to wait before retrying (rate limits and fail-closed outages).
+      examples:
+        - code: not_found
+          message: The requested resource was not found.
+          requestId: 3f0c6a52-6a8e-4c1e-9d0b-2f7f1c5b8a10
+
+    Timestamp:
+      type: string
+      format: date-time
+      pattern: 'Z$'
+      description: UTC ISO 8601 date-time with a `Z` suffix.
+    NullableTimestamp:
+      type: [string, 'null']
+      format: date-time
+      pattern: 'Z$'
+      description: UTC ISO 8601 date-time with a `Z` suffix, or null when the event has not happened.
+    ByteCount:
+      type: integer
+      format: int64
+      minimum: 0
+      maximum: 9007199254740991
+      description: >-
+        Bytes (1 GiB = 1,073,741,824 bytes). Values stay within the JavaScript safe-integer range
+        (at most 2^53 - 1), so web clients can use plain numbers without precision loss.
+    WireGuardPublicKey:
+      type: string
+      minLength: 44
+      maxLength: 44
+      pattern: '^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$'
+      description: WireGuard (Curve25519) public key, base64-encoded 32 bytes.
+    LocationId:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9-]{1,31}$'
+      description: Stable location identifier (Proposed format).
+    Email:
+      type: string
+      format: email
+      maxLength: 254
+    NewPassword:
+      type: string
+      minLength: 12
+      maxLength: 128
+      writeOnly: true
+      description: Proposed policy of 12 to 128 characters, finalized in M04. Never logged or returned.
+    CurrentPassword:
+      type: string
+      minLength: 1
+      maxLength: 128
+      writeOnly: true
+      description: The account's current password, for sign-in or reauthentication. Never logged or returned.
+    Tier:
+      type: string
+      enum: [free, premium]
+      description: Plan tier. `premium` is used from M10 only.
+    IpAddress:
+      type: string
+      minLength: 2
+      maxLength: 45
+      description: IPv4 or IPv6 address in text form.
+    Cidr:
+      type: string
+      minLength: 4
+      maxLength: 49
+      description: IPv4 or IPv6 prefix in CIDR notation.
+    DeviceState:
+      type: string
+      enum: [active, revocation_pending, revoked]
+      description: '`revocation_pending` until every node acknowledges peer removal or the hard lease expiry passes.'
+    EntitlementSource:
+      type: string
+      enum: [free_default, play_subscription, admin_grant]
+      description: '`play_subscription` and `admin_grant` (time-bound, permissioned and audited) are M10 only.'
+    EntitlementState:
+      type: string
+      enum: [active, grace, expired, revoked]
+      description: Proposed. `grace` covers a Play grace period (M10).
+    Cursor:
+      type: [string, 'null']
+      description: Pass as `cursor` to get the next page; null on the last page.
+
+    Health:
+      type: object
+      required: [status, service, version, time]
+      properties:
+        status:
+          type: string
+          const: ok
+        service:
+          type: string
+          const: yashi-api
+        version:
+          type: string
+          description: API build version.
+        time:
+          $ref: '#/components/schemas/Timestamp'
+          description: Server time.
+    Accepted:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: accepted
+
+    RegisterRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, privacyTextVersion]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          $ref: '#/components/schemas/NewPassword'
+        privacyTextVersion:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Proposed. Version of the privacy text the user saw before signing up.
+    TokenRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+          description: Single-use token from an email link. The server stores only its hash.
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password, clientType]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        password:
+          $ref: '#/components/schemas/CurrentPassword'
+        clientType:
+          $ref: '#/components/schemas/ClientType'
+    ClientType:
+      type: string
+      enum: [android, web]
+      description: Proposed. Shown in the session list instead of IP addresses or user agents.
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+    TokenResponse:
+      type: object
+      required: [tokenType, accessToken, accessTokenExpiresAt, refreshToken, refreshTokenExpiresAt, sessionId]
+      properties:
+        tokenType:
+          type: string
+          const: Bearer
+        accessToken:
+          type: string
+          description: Short-lived access token.
+        accessTokenExpiresAt:
+          $ref: '#/components/schemas/Timestamp'
+        refreshToken:
+          type: string
+          description: Single-use refresh token, rotated on every refresh. The server stores only its hash.
+        refreshTokenExpiresAt:
+          $ref: '#/components/schemas/Timestamp'
+        sessionId:
+          type: string
+          format: uuid
+    PasswordResetRequest:
+      type: object
+      additionalProperties: false
+      required: [email]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+    PasswordResetConfirmRequest:
+      type: object
+      additionalProperties: false
+      required: [token, newPassword]
+      properties:
+        token:
+          type: string
+          minLength: 16
+          maxLength: 512
+          writeOnly: true
+        newPassword:
+          $ref: '#/components/schemas/NewPassword'
+    PasswordChangeRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword, newPassword]
+      properties:
+        currentPassword:
+          $ref: '#/components/schemas/CurrentPassword'
+        newPassword:
+          $ref: '#/components/schemas/NewPassword'
+
+    Account:
+      type: object
+      required: [id, email, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          $ref: '#/components/schemas/Email'
+          description: Verified email address.
+        status:
+          type: string
+          enum: [active, suspended]
+          description: A suspended account can sign in, contact support and delete itself, but cannot obtain leases.
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+    Entitlement:
+      type: object
+      description: Server-derived only; never set from client input.
+      required: [planVersionId, tier, quotaBytes, deviceLimit, eligibleLocationIds, source, state, startsAt, endsAt]
+      properties:
+        planVersionId:
+          type: string
+          format: uuid
+        tier:
+          $ref: '#/components/schemas/Tier'
+        quotaBytes:
+          $ref: '#/components/schemas/ByteCount'
+          description: Allowance per monthly period. Proposed free plan 5 GiB (5368709120 bytes).
+        deviceLimit:
+          type: integer
+          minimum: 1
+          maximum: 100
+          description: Enrolled-device limit. Proposed free plan 1.
+        eligibleLocationIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/LocationId'
+        source:
+          $ref: '#/components/schemas/EntitlementSource'
+        state:
+          $ref: '#/components/schemas/EntitlementState'
+        startsAt:
+          $ref: '#/components/schemas/Timestamp'
+        endsAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+          description: Null for open-ended entitlements such as the free plan.
+    Usage:
+      type: object
+      required: [periodStart, periodEnd, quotaBytes, usedBytes, remainingBytes, state, lastMeasuredAt, daily]
+      properties:
+        periodStart:
+          $ref: '#/components/schemas/Timestamp'
+          description: 00:00 UTC on the first calendar day of the month.
+        periodEnd:
+          $ref: '#/components/schemas/Timestamp'
+          description: Exclusive end, equal to the next period start. This is the reset time shown to users.
+        quotaBytes:
+          $ref: '#/components/schemas/ByteCount'
+          description: Allowance for this period from the entitlement's plan version.
+        usedBytes:
+          $ref: '#/components/schemas/ByteCount'
+          description: >-
+            WireGuard peer RX plus TX counted for this account in this period (disclosed product usage; host egress
+            bills are separate). Can exceed `quotaBytes` by at most the documented accounting tolerance
+            (proposed 16 MiB).
+        remainingBytes:
+          $ref: '#/components/schemas/ByteCount'
+          description: The larger of `quotaBytes` minus `usedBytes` and zero.
+        state:
+          type: string
+          enum: [available, exhausted]
+        lastMeasuredAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+          description: Time of the newest node measurement included in `usedBytes`; null before the first measurement.
+        daily:
+          type: array
+          description: Aggregate bytes per UTC day of this period, for the portal usage chart. No destinations or per-connection data.
+          items:
+            type: object
+            required: [date, bytes]
+            properties:
+              date:
+                type: string
+                format: date
+              bytes:
+                $ref: '#/components/schemas/ByteCount'
+
+    Session:
+      type: object
+      required: [id, clientType, createdAt, lastRefreshedAt, expiresAt, current]
+      properties:
+        id:
+          type: string
+          format: uuid
+        clientType:
+          $ref: '#/components/schemas/ClientType'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        lastRefreshedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        expiresAt:
+          $ref: '#/components/schemas/Timestamp'
+        current:
+          type: boolean
+          description: True for the session that made this request.
+    SessionList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+
+    PrivacySetting:
+      type: string
+      enum: [crash_reports, diagnostics]
+      description: Initial settings named in team pack 03. Adding a setting needs privacy review.
+    PrivacyChoice:
+      type: object
+      required: [setting, value, changedAt, privacyTextVersion]
+      properties:
+        setting:
+          $ref: '#/components/schemas/PrivacySetting'
+        value:
+          type: boolean
+        changedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+          description: Null if the user has never changed this setting.
+        privacyTextVersion:
+          type: [string, 'null']
+          description: Privacy-text version shown when the user last changed this setting.
+    PrivacyChoices:
+      type: object
+      required: [currentPrivacyTextVersion, choices]
+      properties:
+        currentPrivacyTextVersion:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/PrivacyChoice'
+    PrivacyChoicesUpdate:
+      type: object
+      additionalProperties: false
+      required: [privacyTextVersion, choices]
+      properties:
+        privacyTextVersion:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: The privacy-text version shown to the user when making this change.
+        choices:
+          type: array
+          minItems: 1
+          maxItems: 10
+          description: At most one entry per setting.
+          items:
+            type: object
+            additionalProperties: false
+            required: [setting, value]
+            properties:
+              setting:
+                $ref: '#/components/schemas/PrivacySetting'
+              value:
+                type: boolean
+
+    DeviceEnrollmentRequest:
+      type: object
+      additionalProperties: false
+      description: Public key and label only. Unknown fields are rejected.
+      required: [publicKey, label]
+      properties:
+        publicKey:
+          $ref: '#/components/schemas/WireGuardPublicKey'
+        label:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Friendly name chosen by the user.
+    Device:
+      type: object
+      required: [id, label, publicKey, state, enrolledAt, revokedAt, accessEndsBy]
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        publicKey:
+          $ref: '#/components/schemas/WireGuardPublicKey'
+        state:
+          $ref: '#/components/schemas/DeviceState'
+        enrolledAt:
+          $ref: '#/components/schemas/Timestamp'
+        revokedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+          description: When revocation was requested.
+        accessEndsBy:
+          $ref: '#/components/schemas/NullableTimestamp'
+          description: While revocation is pending, the latest time node access can continue (hard lease expiry). Proposed.
+    DeviceList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Device'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+
+    LocationStatus:
+      type: string
+      enum: [available, maintenance, at_capacity, unavailable]
+      description: Proposed. `at_capacity` means new leases are paused because capacity is low.
+    Location:
+      type: object
+      description: Sanitized catalog entry. Never includes node management addresses, provider references or credentials.
+      required: [id, countryCode, city, status, eligibleTiers, protocol, measuredAt, measurementAgeSeconds]
+      properties:
+        id:
+          $ref: '#/components/schemas/LocationId'
+        countryCode:
+          type: string
+          pattern: '^[A-Z]{2}$'
+          description: ISO 3166-1 alpha-2 code. Clients show a localized country name.
+        city:
+          type: string
+          maxLength: 64
+        status:
+          $ref: '#/components/schemas/LocationStatus'
+        eligibleTiers:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tier'
+        protocol:
+          type: string
+          const: wireguard
+        measuredAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Time of the server's latest health measurement for this location.
+        measurementAgeSeconds:
+          type: integer
+          minimum: 0
+          description: Age of that measurement when the response was generated, computed on the server so it does not depend on the device clock.
+    LocationCatalog:
+      type: object
+      required: [generatedAt, locations]
+      properties:
+        generatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        locations:
+          type: array
+          items:
+            $ref: '#/components/schemas/Location'
+
+    LeaseRequest:
+      type: object
+      additionalProperties: false
+      required: [deviceId, locationId]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+          description: An active device of the caller.
+        locationId:
+          $ref: '#/components/schemas/LocationId'
+    Lease:
+      type: object
+      required: [id, deviceId, locationId, state, endReason, provisioning, tunnel, renewAfter, expiresAt, createdAt, endedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        deviceId:
+          type: string
+          format: uuid
+        locationId:
+          $ref: '#/components/schemas/LocationId'
+        state:
+          type: string
+          enum: [active, revoking, ended]
+          description: Authorization lifecycle. A free account has at most one `active` lease.
+        endReason:
+          type: [string, 'null']
+          enum: [user_revoked, device_revoked, replaced, expired, quota_exhausted, account_suspended, account_deleted, node_revoked, null]
+          description: Why the lease is revoking or ended; null while active (Proposed values).
+        provisioning:
+          $ref: '#/components/schemas/LeaseProvisioning'
+        tunnel:
+          description: WireGuard parameters for this lease; null once the lease has ended.
+          oneOf:
+            - $ref: '#/components/schemas/TunnelParameters'
+            - type: 'null'
+        renewAfter:
+          $ref: '#/components/schemas/Timestamp'
+          description: Renew at or after this time (proposed 5 minutes after the grant or latest renewal).
+        expiresAt:
+          $ref: '#/components/schemas/Timestamp'
+          description: Expiry enforced by the server and the node (proposed 15 minutes after the grant or latest renewal). Access ends here even if the control plane is unreachable.
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        endedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+    LeaseProvisioning:
+      type: object
+      description: Desired versus actual peer state on the node.
+      required: [state, desired, actual, reason, updatedAt]
+      properties:
+        state:
+          type: string
+          enum: [pending, ready, failed]
+          description: >-
+            `pending`: the node has not yet acknowledged the desired state. `ready`: the node acknowledged it.
+            `failed`: the node reported an error or acknowledgement timed out; see `reason`.
+        desired:
+          type: string
+          enum: [present, absent]
+          description: Peer state the control plane wants on the node.
+        actual:
+          type: string
+          enum: [present, absent, unknown]
+          description: Peer state last acknowledged by the node agent; `unknown` while the agent is unreachable.
+        reason:
+          type: [string, 'null']
+          maxLength: 64
+          description: Machine-readable detail when pending or failed, for example `awaiting_node_ack`, `awaiting_previous_revocation`, `node_unreachable` or `node_error` (Proposed values).
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+    TunnelParameters:
+      type: object
+      description: >-
+        Assigned when the lease is granted. The device composes its WireGuard configuration locally from these values
+        and the key pair it generated; nothing here is secret.
+      required: [addresses, dns, allowedIps, peer]
+      properties:
+        addresses:
+          type: array
+          minItems: 1
+          maxItems: 2
+          description: Tunnel interface addresses assigned to this device for this lease (IPv4, plus IPv6 if the M03 decision routes IPv6).
+          items:
+            $ref: '#/components/schemas/Cidr'
+        dns:
+          type: array
+          minItems: 1
+          maxItems: 4
+          description: Approved DNS resolver addresses, reachable only inside the tunnel.
+          items:
+            $ref: '#/components/schemas/IpAddress'
+        allowedIps:
+          type: array
+          minItems: 1
+          maxItems: 32
+          description: Allowed routes (WireGuard AllowedIPs). Full tunnel; IPv6 is either routed or blocked per the M03 decision, never left to escape.
+          items:
+            $ref: '#/components/schemas/Cidr'
+        peer:
+          type: object
+          required: [publicKey, endpoint]
+          properties:
+            publicKey:
+              $ref: '#/components/schemas/WireGuardPublicKey'
+              description: The node's public key.
+            endpoint:
+              type: string
+              maxLength: 261
+              description: The node's public UDP tunnel endpoint as host:port. Never a management address.
+
+    StatusLevel:
+      type: string
+      enum: [operational, degraded, partial_outage, major_outage, maintenance]
+    IncidentStatus:
+      type: string
+      enum: [investigating, identified, monitoring, resolved]
+    IncidentImpact:
+      type: string
+      enum: [degraded_performance, partial_outage, major_outage, maintenance]
+    StatusComponentId:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9-]{1,31}$'
+      description: Proposed components are `api`, `accounts`, `website` and one per location ID.
+    ServiceStatus:
+      type: object
+      required: [updatedAt, overall, components, incidents]
+      properties:
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        overall:
+          $ref: '#/components/schemas/StatusLevel'
+        components:
+          type: array
+          items:
+            type: object
+            required: [id, name, status, updatedAt]
+            properties:
+              id:
+                $ref: '#/components/schemas/StatusComponentId'
+              name:
+                type: string
+                maxLength: 64
+              status:
+                $ref: '#/components/schemas/StatusLevel'
+              updatedAt:
+                $ref: '#/components/schemas/Timestamp'
+        incidents:
+          type: array
+          description: Published incidents that are not yet resolved.
+          items:
+            $ref: '#/components/schemas/PublicIncident'
+    IncidentUpdate:
+      type: object
+      required: [postedAt, status, message]
+      properties:
+        postedAt:
+          $ref: '#/components/schemas/Timestamp'
+        status:
+          $ref: '#/components/schemas/IncidentStatus'
+        message:
+          type: string
+          maxLength: 2000
+    PublicIncident:
+      type: object
+      required: [id, title, status, impact, componentIds, startedAt, updatedAt, resolvedAt, updates]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          maxLength: 120
+        status:
+          $ref: '#/components/schemas/IncidentStatus'
+        impact:
+          $ref: '#/components/schemas/IncidentImpact'
+        componentIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/StatusComponentId'
+        startedAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        resolvedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        updates:
+          type: array
+          description: Newest first.
+          items:
+            $ref: '#/components/schemas/IncidentUpdate'
+
+    BetaInterestRequest:
+      type: object
+      additionalProperties: false
+      required: [email, consentTextVersion]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        consentTextVersion:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Version of the consent text the person agreed to.
+        source:
+          type: string
+          pattern: '^[a-z0-9_-]{1,32}$'
+          description: Where the signup came from, for example `website_home` (Proposed values).
+
+    TicketStatus:
+      type: string
+      enum: [open, awaiting_customer, closed]
+      description: Proposed states.
+    TicketCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [subject, message]
+      properties:
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 120
+        message:
+          type: string
+          minLength: 1
+          maxLength: 5000
+        diagnosticsReportId:
+          type: string
+          format: uuid
+          description: Optional link to the caller's own diagnostics report.
+    Ticket:
+      type: object
+      required: [id, subject, status, createdAt, updatedAt, closedAt, retentionExpiresAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        subject:
+          type: string
+        status:
+          $ref: '#/components/schemas/TicketStatus'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        closedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        retentionExpiresAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+          description: When ticket content will be deleted (proposed 90 days after close); null while open.
+    TicketDetail:
+      allOf:
+        - $ref: '#/components/schemas/Ticket'
+        - type: object
+          required: [messages]
+          properties:
+            messages:
+              type: array
+              description: Oldest first.
+              items:
+                type: object
+                required: [id, author, body, createdAt]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  author:
+                    type: string
+                    enum: [customer, support]
+                    description: Staff replies are shown as `support`, without staff identity.
+                  body:
+                    type: string
+                    maxLength: 5000
+                  createdAt:
+                    $ref: '#/components/schemas/Timestamp'
+    TicketList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ticket'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+
+    DiagnosticsSubmission:
+      type: object
+      additionalProperties: false
+      required: [appVersion, consent, payload]
+      properties:
+        deviceId:
+          type: string
+          format: uuid
+          description: The caller's device the report describes, if any.
+        appVersion:
+          type: string
+          minLength: 1
+          maxLength: 32
+        consent:
+          type: object
+          additionalProperties: false
+          required: [confirmedAt, privacyTextVersion]
+          description: Explicit consent given after the in-app preview.
+          properties:
+            confirmedAt:
+              $ref: '#/components/schemas/Timestamp'
+            privacyTextVersion:
+              type: string
+              minLength: 1
+              maxLength: 32
+        payload:
+          type: object
+          description: >-
+            The redacted report exactly as previewed. Allow-listed fields are defined in M05 (Proposed). Must not
+            contain browsing destinations, DNS queries, visited addresses, packet data, tokens or keys.
+    DiagnosticsReceipt:
+      type: object
+      required: [id, receivedAt, retentionExpiresAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        receivedAt:
+          $ref: '#/components/schemas/Timestamp'
+        retentionExpiresAt:
+          $ref: '#/components/schemas/Timestamp'
+
+    AccountDeletionRequest:
+      type: object
+      additionalProperties: false
+      required: [currentPassword]
+      properties:
+        currentPassword:
+          $ref: '#/components/schemas/CurrentPassword'
+    AccountDeletionReceipt:
+      type: object
+      required: [requestedAt, sessionsRevoked, accessRevocation, accessEndsBy]
+      properties:
+        requestedAt:
+          $ref: '#/components/schemas/Timestamp'
+        sessionsRevoked:
+          type: boolean
+          const: true
+          description: Every session and refresh token was revoked before this response.
+        accessRevocation:
+          type: string
+          enum: [confirmed, pending]
+          description: Whether every node acknowledged peer removal before the response.
+        accessEndsBy:
+          $ref: '#/components/schemas/NullableTimestamp'
+          description: When `pending`, the latest time node access can continue (hard lease expiry).
+
+    PlayPurchaseVerificationRequest:
+      type: object
+      additionalProperties: false
+      required: [productId, purchaseToken]
+      properties:
+        productId:
+          type: string
+          minLength: 1
+          maxLength: 150
+        purchaseToken:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          writeOnly: true
+          description: Google Play purchase token. Verified server-side and stored encrypted; staff see only a short reference.
+    PlayPurchaseVerificationResult:
+      type: object
+      required: [subscriptionState, expiresAt, entitlement]
+      properties:
+        subscriptionState:
+          type: string
+          enum: [pending, active, in_grace_period, on_hold, canceled, expired, revoked]
+          description: Proposed mapping of verified Play states. `canceled` means auto-renew is off but access lasts until `expiresAt`; `revoked` covers refunds and revocations.
+        expiresAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        entitlement:
+          $ref: '#/components/schemas/Entitlement'
+
+    AdminRole:
+      type: string
+      enum: [owner, operator, support, read_only]
+    AdminReason:
+      type: string
+      minLength: 5
+      maxLength: 500
+      description: Why the action is taken. Required on every admin mutation and stored in the admin audit. Must not contain secrets or traffic data.
+    AdminReasonRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          $ref: '#/components/schemas/AdminReason'
+    AdminOperation:
+      type: object
+      required: [id, kind, targetId, state, progress, errorCode, requestedAt, requestedBy, updatedAt, completedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [user_suspension, device_revocation, node_drain, node_revocation]
+        targetId:
+          type: string
+          format: uuid
+        state:
+          type: string
+          enum: [pending, in_progress, completed, failed]
+        progress:
+          type: object
+          description: >-
+            Node work for this operation. Suspension and revocation count peer removals acknowledged by node agents
+            or ended by hard lease expiry; drain counts leases ended on the node.
+          required: [expected, confirmed, failed]
+          properties:
+            expected:
+              type: integer
+              minimum: 0
+            confirmed:
+              type: integer
+              minimum: 0
+            failed:
+              type: integer
+              minimum: 0
+        errorCode:
+          type: [string, 'null']
+          maxLength: 64
+        requestedAt:
+          $ref: '#/components/schemas/Timestamp'
+        requestedBy:
+          type: string
+          format: uuid
+          description: AdminUser ID.
+        updatedAt:
+          $ref: '#/components/schemas/Timestamp'
+        completedAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+
+    CustomerStatus:
+      type: string
+      enum: [active, suspended, deletion_pending]
+    CustomerSearchRequest:
+      type: object
+      additionalProperties: false
+      required: [email, reason]
+      properties:
+        email:
+          $ref: '#/components/schemas/Email'
+        reason:
+          $ref: '#/components/schemas/AdminReason'
+    CustomerSummary:
+      type: object
+      required: [id, emailMasked, status, tier, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        emailMasked:
+          type: string
+          description: Masked address, for example the first character and the domain only (Proposed format).
+        status:
+          $ref: '#/components/schemas/CustomerStatus'
+        tier:
+          $ref: '#/components/schemas/Tier'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+    CustomerDetail:
+      allOf:
+        - $ref: '#/components/schemas/CustomerSummary'
+        - type: object
+          required: [entitlement, usage, devices, supportTickets]
+          properties:
+            entitlement:
+              type: object
+              required: [planVersionId, tier, state, source, endsAt]
+              properties:
+                planVersionId:
+                  type: string
+                  format: uuid
+                tier:
+                  $ref: '#/components/schemas/Tier'
+                state:
+                  $ref: '#/components/schemas/EntitlementState'
+                source:
+                  $ref: '#/components/schemas/EntitlementSource'
+                endsAt:
+                  $ref: '#/components/schemas/NullableTimestamp'
+            usage:
+              type: object
+              description: Quota aggregate only.
+              required: [periodStart, periodEnd, quotaBytes, usedBytes, lastMeasuredAt]
+              properties:
+                periodStart:
+                  $ref: '#/components/schemas/Timestamp'
+                periodEnd:
+                  $ref: '#/components/schemas/Timestamp'
+                quotaBytes:
+                  $ref: '#/components/schemas/ByteCount'
+                usedBytes:
+                  $ref: '#/components/schemas/ByteCount'
+                lastMeasuredAt:
+                  $ref: '#/components/schemas/NullableTimestamp'
+            devices:
+              type: array
+              description: No keys or WireGuard configurations.
+              items:
+                type: object
+                required: [id, label, state, enrolledAt, revokedAt]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  label:
+                    type: string
+                  state:
+                    $ref: '#/components/schemas/DeviceState'
+                  enrolledAt:
+                    $ref: '#/components/schemas/Timestamp'
+                  revokedAt:
+                    $ref: '#/components/schemas/NullableTimestamp'
+            supportTickets:
+              type: array
+              description: Ticket history without content.
+              items:
+                type: object
+                required: [id, status, createdAt, closedAt]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    $ref: '#/components/schemas/TicketStatus'
+                  createdAt:
+                    $ref: '#/components/schemas/Timestamp'
+                  closedAt:
+                    $ref: '#/components/schemas/NullableTimestamp'
+    CustomerList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CustomerSummary'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+
+    NodeLifecycle:
+      type: string
+      enum: [provisioning, validating, ready, draining, offline, quarantined, retired]
+      description: From M07 (provision, validate, ready, drain, offline or replace). `quarantined` follows an emergency revoke (Proposed).
+    Node:
+      type: object
+      description: Operational view. Never includes cloud credentials, management credentials or the node private key.
+      required: [id, providerRef, region, city, locationId, publicEndpoint, publicKey, lifecycle, health, lastHeartbeatAt, heartbeatAgeSeconds, maxActiveLeases, activeLeases, activeAccounts, livePeers, recentHandshakes, utilization, transferAllowance]
+      properties:
+        id:
+          type: string
+          format: uuid
+        providerRef:
+          type: string
+          maxLength: 128
+          description: The hosting provider's identifier for the server. Not a credential.
+        region:
+          type: string
+          maxLength: 64
+        city:
+          type: string
+          maxLength: 64
+        locationId:
+          $ref: '#/components/schemas/LocationId'
+        publicEndpoint:
+          type: string
+          maxLength: 261
+          description: Public UDP tunnel endpoint as host:port.
+        publicKey:
+          $ref: '#/components/schemas/WireGuardPublicKey'
+        lifecycle:
+          $ref: '#/components/schemas/NodeLifecycle'
+        health:
+          type: string
+          enum: [healthy, degraded, unhealthy, unknown]
+        lastHeartbeatAt:
+          $ref: '#/components/schemas/NullableTimestamp'
+        heartbeatAgeSeconds:
+          type: [integer, 'null']
+          minimum: 0
+        maxActiveLeases:
+          type: [integer, 'null']
+          minimum: 0
+          description: Lease cap from measured load tests (M08); null until measured.
+        activeLeases:
+          type: integer
+          minimum: 0
+          description: Leases in state `active` on this node (control-plane view).
+        activeAccounts:
+          type: integer
+          minimum: 0
+          description: Distinct accounts with an active lease on this node.
+        livePeers:
+          type: integer
+          minimum: 0
+          description: Peers present on the node in the latest agent report.
+        recentHandshakes:
+          type: integer
+          minimum: 0
+          description: Peers with a recent WireGuard handshake in the latest agent report. Counted separately from peers and accounts.
+        utilization:
+          type: object
+          required: [cpuPercent, networkBitsPerSecond, measuredAt]
+          properties:
+            cpuPercent:
+              type: [number, 'null']
+              minimum: 0
+              maximum: 100
+            networkBitsPerSecond:
+              type: [integer, 'null']
+              minimum: 0
+            measuredAt:
+              $ref: '#/components/schemas/NullableTimestamp'
+        transferAllowance:
+          type: object
+          description: Provider transfer allowance. Host billing differs from app quota counts and is never equated with them.
+          required: [includedBytes, remainingBytes, isEstimate, billingPeriodStart, billingPeriodEnd]
+          properties:
+            includedBytes:
+              type: [integer, 'null']
+              format: int64
+              minimum: 0
+              maximum: 9007199254740991
+            remainingBytes:
+              type: [integer, 'null']
+              format: int64
+              minimum: 0
+              maximum: 9007199254740991
+            isEstimate:
+              type: boolean
+              description: True when computed from our own counters rather than the provider's billing data.
+            billingPeriodStart:
+              $ref: '#/components/schemas/NullableTimestamp'
+            billingPeriodEnd:
+              $ref: '#/components/schemas/NullableTimestamp'
+    NodeList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+
+    PlanVersion:
+      type: object
+      description: Immutable once created.
+      required: [id, tier, version, quotaBytes, deviceLimit, eligibleLocationIds, effectiveFrom, createdAt, createdBy]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tier:
+          $ref: '#/components/schemas/Tier'
+        version:
+          type: integer
+          minimum: 1
+          description: Increments per tier.
+        quotaBytes:
+          $ref: '#/components/schemas/ByteCount'
+        deviceLimit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        eligibleLocationIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/LocationId'
+        effectiveFrom:
+          $ref: '#/components/schemas/Timestamp'
+        createdAt:
+          $ref: '#/components/schemas/Timestamp'
+        createdBy:
+          type: string
+          format: uuid
+          description: AdminUser ID.
+    PlanVersionCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [tier, quotaBytes, deviceLimit, eligibleLocationIds, effectiveFrom, reason]
+      properties:
+        tier:
+          $ref: '#/components/schemas/Tier'
+        quotaBytes:
+          $ref: '#/components/schemas/ByteCount'
+        deviceLimit:
+          type: integer
+          minimum: 1
+          maximum: 100
+        eligibleLocationIds:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/LocationId'
+        effectiveFrom:
+          $ref: '#/components/schemas/Timestamp'
+        reason:
+          $ref: '#/components/schemas/AdminReason'
+    PlanVersionList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanVersion'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+
+    AuditObjectType:
+      type: string
+      enum: [user, device, lease, node, plan_version, incident, admin_user, setting]
+      description: Proposed object types.
+    AuditEntry:
+      type: object
+      required: [id, at, actorId, actorRole, action, objectType, objectId, reason, requestId]
+      properties:
+        id:
+          type: string
+          format: uuid
+        at:
+          $ref: '#/components/schemas/Timestamp'
+        actorId:
+          type: string
+          format: uuid
+          description: AdminUser ID. Every entry has an individual actor; there are no shared accounts.
+        actorRole:
+          $ref: '#/components/schemas/AdminRole'
+        action:
+          type: string
+          pattern: '^[a-z_]+\.[a-z_]+$'
+          description: For example `user.suspend`, `device.revoke`, `node.drain`, `plan_version.create` or `user.view` (Proposed values).
+        objectType:
+          $ref: '#/components/schemas/AuditObjectType'
+        objectId:
+          type: string
+          maxLength: 64
+        reason:
+          type: [string, 'null']
+          maxLength: 500
+          description: Required for mutations; null for access events.
+        requestId:
+          type: string
+          format: uuid
+    AuditEntryList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AuditEntry'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'
+
+    Incident:
+      allOf:
+        - $ref: '#/components/schemas/PublicIncident'
+        - type: object
+          required: [visibility, createdBy]
+          properties:
+            visibility:
+              type: string
+              enum: [draft, published]
+            createdBy:
+              type: string
+              format: uuid
+              description: AdminUser ID. Never shown publicly.
+    IncidentCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [title, status, impact, componentIds, message, visibility, reason]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 120
+        status:
+          $ref: '#/components/schemas/IncidentStatus'
+        impact:
+          $ref: '#/components/schemas/IncidentImpact'
+        componentIds:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/StatusComponentId'
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: First public update.
+        visibility:
+          type: string
+          enum: [draft, published]
+        reason:
+          $ref: '#/components/schemas/AdminReason'
+    IncidentUpdateRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      minProperties: 2
+      properties:
+        status:
+          $ref: '#/components/schemas/IncidentStatus'
+        impact:
+          $ref: '#/components/schemas/IncidentImpact'
+        visibility:
+          type: string
+          enum: [draft, published]
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Appended as a new public update.
+        reason:
+          $ref: '#/components/schemas/AdminReason'
+    IncidentList:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Incident'
+        nextCursor:
+          $ref: '#/components/schemas/Cursor'

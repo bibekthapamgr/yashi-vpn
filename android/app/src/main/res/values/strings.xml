@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="starter_title">Yashi VPN</string>
+    <string name="starter_badge">Engineering starter build (M01)</string>
+    <string name="starter_body">This build has no VPN connection. The real WireGuard tunnel is built in milestone M03.</string>
+</resources>
