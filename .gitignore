@@ -1,0 +1,31 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Environment files and secrets (never commit real values)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.jks
+*.keystore
+service-account*.json
+
+# Android / Gradle
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/.idea/
+android/captures/
+android/.cxx/
+*.iml
+
+# OS and editors
+.DS_Store
+.idea/
+.vscode/
